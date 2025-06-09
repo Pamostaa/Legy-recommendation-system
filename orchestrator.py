@@ -2,7 +2,9 @@ import numpy as np
 from mmr import apply_mmr
 
 class RecommendationOrchestrator:
-    def __init__(self, collaborative_engine, content_engine, fallback_engine, id_to_name, id_to_vector, labels, restaurant_name_to_id, collections, lambda_mmr=0.7):
+    def __init__(self, collaborative_engine, content_engine, fallback_engine,
+                 id_to_name, id_to_vector, labels, restaurant_name_to_id, collections,
+                 lambda_mmr=0.7, like_weight=0.1, dislike_penalty=0.2):
         self.collab = collaborative_engine
         self.content = content_engine
         self.fallback = fallback_engine
@@ -11,9 +13,9 @@ class RecommendationOrchestrator:
         self.labels = labels
         self.restaurant_name_to_id = restaurant_name_to_id
         self.collections = collections
-
-        # Directly use lambda_mmr passed in (no Mongo fetch)
         self.lambda_mmr = lambda_mmr
+        self.like_weight = like_weight
+        self.dislike_penalty = dislike_penalty
 
     def get_recommendations(self, user_id, top_n=5):
         top_restaurants, sims = self.collab.recommend_restaurants(user_id, top_n)
@@ -40,7 +42,8 @@ class RecommendationOrchestrator:
         if global_recs is not None:
             print(f"[DEBUG] Using global fallback for {user_id}")
             return {
-                "Recommendations": [(r, self.restaurant_name_to_id.get(r.strip().lower(), "Unknown ID")) for r in global_recs["Restaurant"].tolist()],
+                "Recommendations": [(r, self.restaurant_name_to_id.get(r.strip().lower(), "Unknown ID"))
+                                    for r in global_recs["Restaurant"].tolist()],
                 "Products": {},
                 "Restaurants Rated by Target User": [],
                 "Neighboring Users (IDs)": [],
@@ -57,7 +60,21 @@ class RecommendationOrchestrator:
     def format_recommendation_result(self, user_id, top_restaurants, sims):
         products_col = self.collections["products"]
         restaurants_col = self.collections["restaurants"]
+        feedback_col = self.collections["RestaurentReaction"]
+
         recommended_products = {}
+
+        # Load user feedback
+        feedback_docs = feedback_col.find({"userId": user_id})
+        user_likes = set()
+        user_dislikes = set()
+        for doc in feedback_docs:
+            if doc["reaction"] == "LIKE":
+                user_likes.add(doc["restaurantId"])
+            elif doc["reaction"] == "DISLIKE":
+                user_dislikes.add(doc["restaurantId"])
+
+        print(f"[DEBUG] User {user_id} likes {len(user_likes)} restaurants, dislikes {len(user_dislikes)}")
 
         # Prepare MMR on restaurants with safe lookup
         top_restaurant_names = top_restaurants["Restaurant"].tolist()
@@ -73,11 +90,26 @@ class RecommendationOrchestrator:
 
         mmr_restaurants = apply_mmr(top_restaurant_names, relevance_scores, categories, self.lambda_mmr, len(top_restaurant_names))
 
+        restaurant_scores = {}
         for rest_name in mmr_restaurants:
             rest_id = self.restaurant_name_to_id.get(rest_name.strip().lower())
+            base_score = 1.0  # or your computed score
 
-            if not rest_id:
-                recommended_products[rest_name] = "No restaurant ID found"
+            feedback_boost = 0
+            if rest_id in user_likes:
+                feedback_boost += self.like_weight
+            if rest_id in user_dislikes:
+                feedback_boost -= self.dislike_penalty
+
+            final_score = base_score + feedback_boost
+            restaurant_scores[rest_id] = final_score
+
+        # Sort restaurants by final score
+        sorted_restaurants = sorted(restaurant_scores.items(), key=lambda x: x[1], reverse=True)
+
+        for rest_id, _ in sorted_restaurants:
+            rest_name = next((name for name, id_ in self.restaurant_name_to_id.items() if id_ == rest_id), None)
+            if not rest_name:
                 continue
 
             user_has_history = self.collab.order_repository.user_has_history_with_restaurant(user_id, rest_id)
@@ -94,7 +126,7 @@ class RecommendationOrchestrator:
             # Apply MMR on products if available
             if isinstance(products, list):
                 product_names = [p["name"] for p in products]
-                relevance_scores = [1.0 for _ in products]  # assuming equal relevance
+                relevance_scores = [1.0 for _ in products]
                 categories = [p.get("categorieName", "") for p in products]
 
                 mmr_products = apply_mmr(product_names, relevance_scores, categories, self.lambda_mmr, min(5, len(products)))
@@ -115,7 +147,7 @@ class RecommendationOrchestrator:
         target_pref = dict(zip(self.labels, target_vec.round(4).tolist())) if isinstance(target_vec, np.ndarray) else {}
 
         return {
-            "Recommendations": [(r, self.restaurant_name_to_id.get(r.strip().lower(), "Unknown ID")) for r in mmr_restaurants],
+            "Recommendations": [(name, id_) for name, id_ in self.restaurant_name_to_id.items() if id_ in dict(sorted_restaurants)],
             "Products": recommended_products,
             "Restaurants Rated by Target User": [],
             "Neighboring Users (IDs)": [uid for uid, _ in sims],
@@ -123,7 +155,7 @@ class RecommendationOrchestrator:
             "Restaurants Rated by Neighbors": neighbor_info,
             "Neighbor Preferences": neighbor_prefs,
             "Target User Preference": target_pref,
-            "Message": f"Recommendations generated with MMR diversification"
+            "Message": f"Recommendations generated with MMR diversification + feedback adjustment"
         }
 
     def format_product(self, product):

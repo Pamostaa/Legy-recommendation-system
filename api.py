@@ -10,7 +10,6 @@ from collaborative_engine import CollaborativeEngine
 from content_engine import ContentEngine
 from fallback_engine import FallbackEngine
 from orchestrator import RecommendationOrchestrator
-from mongo_utils import save_recommendations_to_mongo
 from user_repository import UserRepository
 from product_repository import ProductRepository
 from order_repository import OrderRepository
@@ -25,13 +24,9 @@ CORS(app)
 MODEL_PATH = config['model_path']
 VECTORS_PATH = config['vectors_path']
 ALPHA = config.get('alpha', 0.01)
-
-# === Load weights ===
-weights_config = config.get('weights', {})
-w1 = weights_config.get('ingredient_similarity', 0.3)
-w2 = weights_config.get('price_proximity', 0.3)
-w3 = weights_config.get('rating', 0.2)
-w4 = weights_config.get('sentiment', 0.2)
+LAMBDA_MMR = config.get('lambda_mmr', 0.7)
+LIKE_WEIGHT = config.get('feedback_weights', {}).get('like_weight', 0.1)
+DISLIKE_PENALTY = config.get('feedback_weights', {}).get('dislike_penalty', 0.2)
 
 # === Load vectors ===
 with open(VECTORS_PATH, "rb") as f:
@@ -63,23 +58,63 @@ collab_engine = CollaborativeEngine(
     model_handler, collections, id_to_vector, name_to_id, id_to_name, labels,
     restaurant_name_to_id, order_repo, product_repo, alpha=ALPHA
 )
-content_engine = ContentEngine(product_repo, order_repo, weights=(w1, w2, w3, w4))
+content_engine = ContentEngine(product_repo, order_repo)
 fallback_engine = FallbackEngine(ratings_df)
 orchestrator = RecommendationOrchestrator(
     collab_engine, content_engine, fallback_engine, id_to_name, id_to_vector, labels,
-    restaurant_name_to_id, collections
+    restaurant_name_to_id, collections, lambda_mmr=LAMBDA_MMR,
+    like_weight=LIKE_WEIGHT, dislike_penalty=DISLIKE_PENALTY
 )
 
+# === ROUTES ===
+
 @app.route("/recommendations", methods=["GET"])
-def get_recommendations():
+def get_full_recommendations():
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "Missing user_id parameter"}), 400
 
     result = orchestrator.get_recommendations(user_id, top_n=5)
     if result:
-        save_recommendations_to_mongo(collections["db"], user_id, result)
         return jsonify(result), 200
+    else:
+        return jsonify({"error": f"No recommendations for user {user_id}"}), 404
+
+@app.route("/recommendations/restaurants", methods=["GET"])
+def get_restaurant_recommendations():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"error": "Missing user_id parameter"}), 400
+
+    result = orchestrator.get_recommendations(user_id, top_n=5)
+    if result:
+        return jsonify({
+            "RecommendedRestaurants": result["Recommendations"]
+        }), 200
+    else:
+        return jsonify({"error": f"No recommendations for user {user_id}"}), 404
+
+@app.route("/recommendations/products", methods=["GET"])
+def get_product_recommendations():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"error": "Missing user_id parameter"}), 400
+
+    result = orchestrator.get_recommendations(user_id, top_n=5)
+    if result:
+        recommended_products = []
+        for rest, products in result["Products"].items():
+            if isinstance(products, list):
+                for p in products:
+                    recommended_products.append({
+                        "restaurant": rest,
+                        "name": p.get("name"),
+                        "price": p.get("price"),
+                        "category": p.get("categorieName", "")
+                    })
+        return jsonify({
+            "RecommendedProducts": recommended_products
+        }), 200
     else:
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
