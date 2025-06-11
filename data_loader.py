@@ -15,10 +15,11 @@ def get_collections(client):
         "db": db,
         "reviews": db["Reviews"],
         "users": db["Users"],
-        "restaurants": db["Restaurents"],
+        "restaurents": db["Restaurents"],
         "products": db["Products"],
         "orders": db["Orders"],
-        "categories": pd.DataFrame(list(db["restaurant_categories"].find()))
+        "categories": pd.DataFrame(list(db["restaurant_categories"].find())),
+        "RestaurentReaction" : db["RestaurentReaction"]
     }
 
 def reload_users(users_col):
