@@ -3,6 +3,10 @@ from flask_cors import CORS
 import yaml
 import pandas as pd
 import pickle
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+import string
+from fuzzywuzzy import fuzz
 
 from data_loader import get_mongo_client, get_collections, reload_users
 from model_handler import BERTModelHandler
@@ -12,7 +16,9 @@ from fallback_engine import FallbackEngine
 from orchestrator import RecommendationOrchestrator
 from user_repository import UserRepository
 from product_repository import ProductRepository
+from bson import ObjectId 
 from order_repository import OrderRepository
+import re
 
 # === Load config ===
 with open('config.yaml') as f:
@@ -62,8 +68,10 @@ content_engine = ContentEngine(product_repo, order_repo)
 fallback_engine = FallbackEngine(ratings_df)
 orchestrator = RecommendationOrchestrator(
     collab_engine, content_engine, fallback_engine, id_to_name, id_to_vector, labels,
-    restaurant_name_to_id, collections, lambda_mmr=LAMBDA_MMR,
-    like_weight=LIKE_WEIGHT, dislike_penalty=DISLIKE_PENALTY
+    restaurant_name_to_id, collections,
+    lambda_mmr=LAMBDA_MMR,
+    like_weight=LIKE_WEIGHT,
+    dislike_penalty=DISLIKE_PENALTY
 )
 
 # === ROUTES ===
@@ -80,6 +88,7 @@ def get_full_recommendations():
     else:
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
+
 @app.route("/recommendations/restaurants", methods=["GET"])
 def get_restaurant_recommendations():
     user_id = request.args.get('user_id')
@@ -93,6 +102,7 @@ def get_restaurant_recommendations():
         }), 200
     else:
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
+
 
 @app.route("/recommendations/products", methods=["GET"])
 def get_product_recommendations():
@@ -117,11 +127,6 @@ def get_product_recommendations():
         }), 200
     else:
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
-
-@app.route("/users", methods=["GET"])
-def list_users():
-    users = collections["db"]["user_recommendations"].find({}, {"user_id": 1, "_id": 0})
-    return jsonify([u["user_id"] for u in users])
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
