@@ -3,11 +3,16 @@ from flask_cors import CORS
 import yaml
 import pandas as pd
 import pickle
+import re
+from bson import ObjectId
+
+# === NLP and utilities ===
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 import string
 from fuzzywuzzy import fuzz
 
+# === App components ===
 from data_loader import get_mongo_client, get_collections, reload_users
 from model_handler import BERTModelHandler
 from collaborative_engine import CollaborativeEngine
@@ -16,9 +21,8 @@ from fallback_engine import FallbackEngine
 from orchestrator import RecommendationOrchestrator
 from user_repository import UserRepository
 from product_repository import ProductRepository
-from bson import ObjectId 
 from order_repository import OrderRepository
-import re
+from kafka_producer import send_kafka_message
 
 # === Load config ===
 with open('config.yaml') as f:
@@ -27,6 +31,7 @@ with open('config.yaml') as f:
 app = Flask(__name__)
 CORS(app)
 
+# === Config variables ===
 MODEL_PATH = config['model_path']
 VECTORS_PATH = config['vectors_path']
 ALPHA = config.get('alpha', 0.01)
@@ -41,8 +46,14 @@ with open(VECTORS_PATH, "rb") as f:
 # === Mongo setup ===
 client = get_mongo_client()
 collections = get_collections(client)
+
+# Debug: show loaded collections
+print("[DEBUG] Loaded collections:", collections.keys())
+
 users_df, name_to_id, id_to_name = reload_users(collections["users"])
 labels = ["cares_about_food_quality", "cares_about_service_speed", "cares_about_price", "cares_about_cleanliness"]
+
+# ✅ Use the fixed key "restaurants" here
 restaurant_name_to_id = {
     r.get("nom").strip().lower(): str(r["_id"])
     for r in collections["restaurants"].find()
@@ -67,8 +78,8 @@ collab_engine = CollaborativeEngine(
 content_engine = ContentEngine(product_repo, order_repo)
 fallback_engine = FallbackEngine(ratings_df)
 orchestrator = RecommendationOrchestrator(
-    collab_engine, content_engine, fallback_engine, id_to_name, id_to_vector, labels,
-    restaurant_name_to_id, collections,
+    collab_engine, content_engine, fallback_engine,
+    id_to_name, id_to_vector, labels, restaurant_name_to_id, collections,
     lambda_mmr=LAMBDA_MMR,
     like_weight=LIKE_WEIGHT,
     dislike_penalty=DISLIKE_PENALTY
@@ -111,6 +122,14 @@ def get_product_recommendations():
         return jsonify({"error": "Missing user_id parameter"}), 400
 
     result = orchestrator.get_recommendations(user_id, top_n=5)
+
+    # 📤 Send Kafka event
+    send_kafka_message("recommendation_requests", {
+        "user_id": user_id,
+        "type": "product",
+        "result": result if result else {}
+    })
+
     if result:
         recommended_products = []
         for rest, products in result["Products"].items():
@@ -128,5 +147,6 @@ def get_product_recommendations():
     else:
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
+# === Start the app ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
