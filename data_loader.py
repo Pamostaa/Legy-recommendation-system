@@ -1,4 +1,3 @@
-# data_loader.py
 import pandas as pd
 from pymongo import MongoClient
 
@@ -8,20 +7,18 @@ def get_mongo_client():
         config = yaml.safe_load(f)
     return MongoClient(config['mongo_uri'])
 
-
 def get_collections(client):
     db = client["recommender_db"]
     return {
         "db": db,
         "reviews": db["Reviews"],
         "users": db["Users"],
-        "restaurants": db["Restaurents"],  
+        "restaurants": db["Restaurents"],  # Assumes normalizedName is stored
         "products": db["Products"],
         "orders": db["Orders"],
         "categories": pd.DataFrame(list(db["restaurant_categories"].find())),
-        "RestaurentReaction" : db["RestaurentReaction"]
+        "RestaurentReaction": db["RestaurentReaction"]
     }
-
 
 def reload_users(users_col):
     users_data = list(users_col.find())

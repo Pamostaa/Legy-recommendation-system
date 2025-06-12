@@ -3,14 +3,8 @@ from flask_cors import CORS
 import yaml
 import pandas as pd
 import pickle
-import re
-from bson import ObjectId
-
-# === NLP and utilities ===
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-import string
-from fuzzywuzzy import fuzz
+import redis
+import json
 
 # === App components ===
 from data_loader import get_mongo_client, get_collections, reload_users
@@ -39,6 +33,13 @@ LAMBDA_MMR = config.get('lambda_mmr', 0.7)
 LIKE_WEIGHT = config.get('feedback_weights', {}).get('like_weight', 0.1)
 DISLIKE_PENALTY = config.get('feedback_weights', {}).get('dislike_penalty', 0.2)
 
+# === Redis setup ===
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+CACHE_EXPIRY = 10 * 24 * 60 * 60  # 10 days
+
+def get_cache_key(user_id, rec_type):
+    return f"recommendation:{rec_type}:{user_id}"
+
 # === Load vectors ===
 with open(VECTORS_PATH, "rb") as f:
     id_to_vector = pickle.load(f)
@@ -46,14 +47,11 @@ with open(VECTORS_PATH, "rb") as f:
 # === Mongo setup ===
 client = get_mongo_client()
 collections = get_collections(client)
-
-# Debug: show loaded collections
 print("[DEBUG] Loaded collections:", collections.keys())
 
 users_df, name_to_id, id_to_name = reload_users(collections["users"])
 labels = ["cares_about_food_quality", "cares_about_service_speed", "cares_about_price", "cares_about_cleanliness"]
 
-# ✅ Use the fixed key "restaurants" here
 restaurant_name_to_id = {
     r.get("nom").strip().lower(): str(r["_id"])
     for r in collections["restaurants"].find()
@@ -65,7 +63,7 @@ user_repo = UserRepository(collections["users"])
 product_repo = ProductRepository(collections["products"])
 order_repo = OrderRepository(collections["orders"])
 
-# === Load ratings from Reviews collection ===
+# === Load ratings ===
 reviews = list(collections["reviews"].find({}))
 ratings_df = pd.DataFrame(reviews)
 
@@ -82,7 +80,9 @@ orchestrator = RecommendationOrchestrator(
     id_to_name, id_to_vector, labels, restaurant_name_to_id, collections,
     lambda_mmr=LAMBDA_MMR,
     like_weight=LIKE_WEIGHT,
-    dislike_penalty=DISLIKE_PENALTY
+    dislike_penalty=DISLIKE_PENALTY,
+    redis_client=redis_client,
+    cache_expiry=CACHE_EXPIRY
 )
 
 # === ROUTES ===
@@ -93,8 +93,17 @@ def get_full_recommendations():
     if not user_id:
         return jsonify({"error": "Missing user_id parameter"}), 400
 
+    cache_key = get_cache_key(user_id, "full")
+    cached = redis_client.get(cache_key)
+    if cached is not None:
+        try:
+            return jsonify(json.loads(cached)), 200
+        except json.JSONDecodeError:
+            print(f"[WARNING] Invalid cached JSON for {cache_key}")
+
     result = orchestrator.get_recommendations(user_id, top_n=5)
     if result:
+        redis_client.setex(cache_key, CACHE_EXPIRY, json.dumps(result))
         return jsonify(result), 200
     else:
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
@@ -106,11 +115,19 @@ def get_restaurant_recommendations():
     if not user_id:
         return jsonify({"error": "Missing user_id parameter"}), 400
 
+    cache_key = get_cache_key(user_id, "restaurant")
+    cached = redis_client.get(cache_key)
+    if cached is not None:
+        try:
+            return jsonify(json.loads(cached)), 200
+        except json.JSONDecodeError:
+            print(f"[WARNING] Invalid cached JSON for {cache_key}")
+
     result = orchestrator.get_recommendations(user_id, top_n=5)
     if result:
-        return jsonify({
-            "RecommendedRestaurants": result["Recommendations"]
-        }), 200
+        payload = {"RecommendedRestaurants": result["Recommendations"]}
+        redis_client.setex(cache_key, CACHE_EXPIRY, json.dumps(payload))
+        return jsonify(payload), 200
     else:
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
@@ -121,14 +138,24 @@ def get_product_recommendations():
     if not user_id:
         return jsonify({"error": "Missing user_id parameter"}), 400
 
+    cache_key = get_cache_key(user_id, "product")
+    cached = redis_client.get(cache_key)
+    if cached is not None:
+        try:
+            return jsonify(json.loads(cached)), 200
+        except json.JSONDecodeError:
+            print(f"[WARNING] Invalid cached JSON for {cache_key}")
+
     result = orchestrator.get_recommendations(user_id, top_n=5)
 
-    # 📤 Send Kafka event
-    send_kafka_message("recommendation_requests", {
-        "user_id": user_id,
-        "type": "product",
-        "result": result if result else {}
-    })
+    try:
+        send_kafka_message("recommendation_requests", {
+            "user_id": user_id,
+            "type": "product",
+            "result": result if result else {}
+        })
+    except Exception as e:
+        print(f"[WARNING] Kafka failed: {e}")
 
     if result:
         recommended_products = []
@@ -141,12 +168,20 @@ def get_product_recommendations():
                         "price": p.get("price"),
                         "category": p.get("categorieName", "")
                     })
-        return jsonify({
-            "RecommendedProducts": recommended_products
-        }), 200
+
+        payload = {"RecommendedProducts": recommended_products}
+        redis_client.setex(cache_key, CACHE_EXPIRY, json.dumps(payload))
+        return jsonify(payload), 200
     else:
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
+
 # === Start the app ===
 if __name__ == "__main__":
+    print("[INFO] Starting Flask server on http://localhost:8000")
     app.run(host="0.0.0.0", port=8000, debug=True)

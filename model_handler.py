@@ -5,6 +5,7 @@ import torch
 from transformers import BertTokenizer, BertForSequenceClassification
 from torch.nn.functional import softmax
 import yaml
+import os
 
 with open('config.yaml') as f:
     config = yaml.safe_load(f)
@@ -15,9 +16,8 @@ class BERTModelHandler:
         self.tokenizer = BertTokenizer.from_pretrained(model_path)
         self.model = BertForSequenceClassification.from_pretrained(model_path)
         self.model.eval()
-        with open(vectors_path, "rb") as f:
-            self.id_to_vector = pickle.load(f)
         self.vectors_path = vectors_path
+        self.id_to_vector = self.load_vectors()
 
     def compute_vector(self, text):
         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
@@ -29,3 +29,10 @@ class BERTModelHandler:
     def save_vectors(self):
         with open(self.vectors_path, "wb") as f:
             pickle.dump(self.id_to_vector, f)
+
+    def load_vectors(self):
+        if os.path.exists(self.vectors_path):
+            with open(self.vectors_path, "rb") as f:
+                return pickle.load(f)
+        print(f"[WARNING] Vectors file not found at {self.vectors_path}. Starting fresh.")
+        return {}

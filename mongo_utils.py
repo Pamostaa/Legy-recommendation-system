@@ -1,4 +1,3 @@
-# mongo_utils.py
 import pandas as pd
 
 def save_recommendations_to_mongo(db, user_id, result):
