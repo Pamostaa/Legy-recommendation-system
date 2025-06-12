@@ -1,10 +1,14 @@
 import numpy as np
 from mmr import apply_mmr
+import json
+from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
 
 class RecommendationOrchestrator:
     def __init__(self, collaborative_engine, content_engine, fallback_engine,
                  id_to_name, id_to_vector, labels, restaurant_name_to_id, collections,
-                 lambda_mmr=0.7, like_weight=0.1, dislike_penalty=0.2):
+                 lambda_mmr=0.7, like_weight=0.1, dislike_penalty=0.2,
+                 redis_client=None, cache_expiry=864000):
         self.collab = collaborative_engine
         self.content = content_engine
         self.fallback = fallback_engine
@@ -16,17 +20,48 @@ class RecommendationOrchestrator:
         self.lambda_mmr = lambda_mmr
         self.like_weight = like_weight
         self.dislike_penalty = dislike_penalty
+        self.redis = redis_client
+        self.cache_expiry = cache_expiry
 
     def get_recommendations(self, user_id, top_n=5):
-        top_restaurants, sims = self.collab.recommend_restaurants(user_id, top_n)
-        if top_restaurants is not None:
-            print(f"[DEBUG] Using collaborative recommendations for {user_id}")
-            return self.format_recommendation_result(user_id, top_restaurants, sims)
+        cache_key = f"recommendations:full:{user_id}"
+        if self.redis:
+            cached = self.redis.get(cache_key)
+            if cached:
+                print(f"[CACHE HIT] Full recommendation for {user_id}")
+                return json.loads(cached)
 
+        collab_key = f"collab:{user_id}"
+        top_restaurants, sims = None, []
+
+        if self.redis:
+            cached_collab = self.redis.get(collab_key)
+            if cached_collab:
+                cached_obj = json.loads(cached_collab)
+                top_restaurants = pd.DataFrame(cached_obj["top_restaurants"])
+                sims = cached_obj["sims"]
+                print(f"[CACHE HIT] Collaborative recs for {user_id}")
+            else:
+                top_restaurants, sims = self.collab.recommend_restaurants(user_id, top_n)
+                if top_restaurants is not None:
+                    collab_payload = {
+                        "top_restaurants": top_restaurants.to_dict(orient="records"),
+                        "sims": sims
+                    }
+                    self.redis.setex(collab_key, self.cache_expiry, json.dumps(collab_payload))
+        else:
+            top_restaurants, sims = self.collab.recommend_restaurants(user_id, top_n)
+
+        if top_restaurants is not None:
+            result = self.format_recommendation_result(user_id, top_restaurants, sims)
+            if self.redis:
+                self.redis.setex(cache_key, self.cache_expiry, json.dumps(result))
+            return result
+
+        # fallback 1
         fallback_recs = self.fallback.preference_fallback(user_id, top_n)
         if fallback_recs is not None:
-            print(f"[DEBUG] Using preference fallback for {user_id}")
-            return {
+            result = {
                 "Recommendations": fallback_recs,
                 "Products": {},
                 "Restaurants Rated by Target User": [],
@@ -35,13 +70,16 @@ class RecommendationOrchestrator:
                 "Restaurants Rated by Neighbors": {},
                 "Neighbor Preferences": {},
                 "Target User Preference": {},
-                "Message": f"Fallback recommendations based on preferences"
+                "Message": "Fallback recommendations based on preferences"
             }
+            if self.redis:
+                self.redis.setex(cache_key, self.cache_expiry, json.dumps(result))
+            return result
 
+        # fallback 2
         global_recs = self.fallback.global_popular_restaurants(top_n)
         if global_recs is not None:
-            print(f"[DEBUG] Using global fallback for {user_id}")
-            return {
+            result = {
                 "Recommendations": [(r, self.restaurant_name_to_id.get(r.strip().lower(), "Unknown ID"))
                                     for r in global_recs["Restaurant"].tolist()],
                 "Products": {},
@@ -51,10 +89,12 @@ class RecommendationOrchestrator:
                 "Restaurants Rated by Neighbors": {},
                 "Neighbor Preferences": {},
                 "Target User Preference": {},
-                "Message": f"Global fallback recommendations"
+                "Message": "Global fallback recommendations"
             }
+            if self.redis:
+                self.redis.setex(cache_key, self.cache_expiry, json.dumps(result))
+            return result
 
-        print(f"[ERROR] No recommendations available for {user_id}")
         return None
 
     def format_recommendation_result(self, user_id, top_restaurants, sims):
@@ -64,79 +104,64 @@ class RecommendationOrchestrator:
 
         recommended_products = {}
 
-        # Load user feedback
-        feedback_docs = feedback_col.find({"userId": user_id})
-        user_likes = set()
-        user_dislikes = set()
-        for doc in feedback_docs:
-            if doc["reaction"] == "LIKE":
-                user_likes.add(doc["restaurantId"])
-            elif doc["reaction"] == "DISLIKE":
-                user_dislikes.add(doc["restaurantId"])
+        top_restaurant_names = top_restaurants["Restaurant"].tolist()[:15]
+        relevance_scores = top_restaurants["Weighted Rating"].tolist()[:15]
+        normalized_names = [r.strip().lower() for r in top_restaurant_names]
 
-        print(f"[DEBUG] User {user_id} likes {len(user_likes)} restaurants, dislikes {len(user_dislikes)}")
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            feedback_future = executor.submit(lambda: list(feedback_col.find({"userId": user_id})))
+            rest_docs_future = executor.submit(lambda: list(restaurants_col.find({"normalizedName": {"$in": normalized_names}})))
+            restaurant_ids = [self.restaurant_name_to_id.get(r.lower()) for r in normalized_names if self.restaurant_name_to_id.get(r.lower())]
+            product_docs_future = executor.submit(lambda: list(products_col.find({"restaurantId": {"$in": restaurant_ids}})))
 
-        # Prepare MMR on restaurants with safe lookup
-        top_restaurant_names = top_restaurants["Restaurant"].tolist()
-        relevance_scores = top_restaurants["Weighted Rating"].tolist()
-        categories = []
-        for r in top_restaurant_names:
-            rest_doc = restaurants_col.find_one({"nom": {"$regex": f"^{r}$", "$options": "i"}})
-            if rest_doc:
-                categories.append(rest_doc.get("internationalCuisine", ""))
-            else:
-                print(f"[WARNING] Restaurant '{r}' not found in DB — assigning empty category.")
-                categories.append("")
+            feedback_docs = feedback_future.result()
+            rest_docs = rest_docs_future.result()
+            product_docs = product_docs_future.result()
 
+        user_likes = {doc["restaurantId"] for doc in feedback_docs if doc["reaction"] == "LIKE"}
+        user_dislikes = {doc["restaurantId"] for doc in feedback_docs if doc["reaction"] == "DISLIKE"}
+
+        name_to_category = {doc["normalizedName"]: doc.get("internationalCuisine", "") for doc in rest_docs}
+        categories = [name_to_category.get(r.strip().lower(), "") for r in top_restaurant_names]
         mmr_restaurants = apply_mmr(top_restaurant_names, relevance_scores, categories, self.lambda_mmr, len(top_restaurant_names))
 
         restaurant_scores = {}
         for rest_name in mmr_restaurants:
             rest_id = self.restaurant_name_to_id.get(rest_name.strip().lower())
-            base_score = 1.0  # or your computed score
+            if not rest_id:
+                continue
+            feedback_boost = self.like_weight if rest_id in user_likes else 0
+            feedback_boost -= self.dislike_penalty if rest_id in user_dislikes else 0
+            restaurant_scores[rest_id] = 1.0 + feedback_boost
 
-            feedback_boost = 0
-            if rest_id in user_likes:
-                feedback_boost += self.like_weight
-            if rest_id in user_dislikes:
-                feedback_boost -= self.dislike_penalty
-
-            final_score = base_score + feedback_boost
-            restaurant_scores[rest_id] = final_score
-
-        # Sort restaurants by final score
         sorted_restaurants = sorted(restaurant_scores.items(), key=lambda x: x[1], reverse=True)
+        sorted_rest_ids = [rest_id for rest_id, _ in sorted_restaurants]
 
-        for rest_id, _ in sorted_restaurants:
+        product_map = {}
+        for doc in product_docs:
+            rid = doc["restaurantId"]
+            product_map.setdefault(rid, []).append(self.format_product(doc))
+
+        for rest_id in sorted_rest_ids:
             rest_name = next((name for name, id_ in self.restaurant_name_to_id.items() if id_ == rest_id), None)
             if not rest_name:
                 continue
 
             user_has_history = self.collab.order_repository.user_has_history_with_restaurant(user_id, rest_id)
+            products = self.content.recommend_products_for_user(user_id, rest_id, top_n=5) if user_has_history else product_map.get(rest_id, [])
 
-            if user_has_history:
-                products = self.content.recommend_products_for_user(client_id=user_id, restaurant_id=rest_id, top_n=5)
-                if not products:
-                    fallback_products = self.collab.product_repository.get_products_by_restaurant(rest_id, limit=5)
-                    products = [self.format_product(p) for p in fallback_products] if fallback_products else "No products available"
-            else:
-                fallback_products = self.collab.product_repository.get_products_by_restaurant(rest_id, limit=5)
-                products = [self.format_product(p) for p in fallback_products] if fallback_products else "No products available"
-
-            # Apply MMR on products if available
-            if isinstance(products, list):
-                product_names = [p["name"] for p in products]
-                relevance_scores = [1.0 for _ in products]
-                categories = [p.get("categorieName", "") for p in products]
-
-                mmr_products = apply_mmr(product_names, relevance_scores, categories, self.lambda_mmr, min(5, len(products)))
+            if isinstance(products, list) and len(products) > 5:
+                names = [p["name"] for p in products]
+                scores = [1.0 for _ in products]
+                cats = [p.get("categorieName", "") for p in products]
+                mmr_products = apply_mmr(names, scores, cats, self.lambda_mmr, 5)
                 products = [p for p in products if p["name"] in mmr_products]
 
-            recommended_products[rest_name] = products
+            recommended_products[rest_name] = products or "No products available"
 
         neighbor_names = [self.id_to_name.get(uid, f"User_{uid}") for uid, _ in sims]
         neighbor_info = {
-            self.id_to_name.get(uid, uid): [r for r in top_restaurants["Restaurant"].tolist()]
+            self.id_to_name.get(uid, uid): top_restaurants["Restaurant"].tolist()
             for uid, _ in sims
         }
         neighbor_prefs = {
@@ -155,7 +180,7 @@ class RecommendationOrchestrator:
             "Restaurants Rated by Neighbors": neighbor_info,
             "Neighbor Preferences": neighbor_prefs,
             "Target User Preference": target_pref,
-            "Message": f"Recommendations generated with MMR diversification + feedback adjustment"
+            "Message": "Optimized for first-time and repeat calls"
         }
 
     def format_product(self, product):
