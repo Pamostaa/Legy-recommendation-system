@@ -1,12 +1,10 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import yaml
-import pandas as pd
-import pickle
-import redis
-import json
+import yaml, pandas as pd, pickle
+from datetime import datetime
+from bson import ObjectId
 
-# === App components ===
+# ========== App components ==========
 from data_loader import get_mongo_client, get_collections, reload_users
 from model_handler import BERTModelHandler
 from collaborative_engine import CollaborativeEngine
@@ -18,170 +16,165 @@ from product_repository import ProductRepository
 from order_repository import OrderRepository
 from kafka_producer import send_kafka_message
 
-# === Load config ===
-with open('config.yaml') as f:
+# ========== Config ==========
+with open("config.yaml") as f:
     config = yaml.safe_load(f)
+
+MODEL_PATH      = config["model_path"]
+VECTORS_PATH    = config["vectors_path"]
+ALPHA           = config.get("alpha", 0.01)
+LAMBDA_MMR      = config.get("lambda_mmr", 0.7)
+LIKE_WEIGHT     = config.get("feedback_weights", {}).get("like_weight", 0.1)
+DISLIKE_PENALTY = config.get("feedback_weights", {}).get("dislike_penalty", 0.2)
 
 app = Flask(__name__)
 CORS(app)
 
-# === Config variables ===
-MODEL_PATH = config['model_path']
-VECTORS_PATH = config['vectors_path']
-ALPHA = config.get('alpha', 0.01)
-LAMBDA_MMR = config.get('lambda_mmr', 0.7)
-LIKE_WEIGHT = config.get('feedback_weights', {}).get('like_weight', 0.1)
-DISLIKE_PENALTY = config.get('feedback_weights', {}).get('dislike_penalty', 0.2)
+# ========== Mongo ==========
+client       = get_mongo_client()
+collections  = get_collections(client)
+db           = client["recommender_db"]
+user_recs    = db["user_recommendations"]
+restaurants  = collections["restaurants"]
+products     = collections["products"]
 
-# === Redis setup ===
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
-CACHE_EXPIRY = 10 * 24 * 60 * 60  # 10 days
+# ========== Data ==========
+users_df, name_to_id, id_to_name = reload_users(collections["users"])
+labels = [
+    "cares_about_food_quality", "cares_about_service_speed",
+    "cares_about_price", "cares_about_cleanliness",
+]
 
-def get_cache_key(user_id, rec_type):
-    return f"recommendation:{rec_type}:{user_id}"
-
-# === Load vectors ===
 with open(VECTORS_PATH, "rb") as f:
     id_to_vector = pickle.load(f)
 
-# === Mongo setup ===
-client = get_mongo_client()
-collections = get_collections(client)
-print("[DEBUG] Loaded collections:", collections.keys())
-
-users_df, name_to_id, id_to_name = reload_users(collections["users"])
-labels = ["cares_about_food_quality", "cares_about_service_speed", "cares_about_price", "cares_about_cleanliness"]
-
 restaurant_name_to_id = {
-    r.get("nom").strip().lower(): str(r["_id"])
-    for r in collections["restaurants"].find()
-    if "nom" in r and "_id" in r
+    doc.get("nom", "").strip().lower(): str(doc["_id"])
+    for doc in restaurants.find({}, {"nom": 1})
 }
 
-# === Initialize repositories ===
-user_repo = UserRepository(collections["users"])
-product_repo = ProductRepository(collections["products"])
-order_repo = OrderRepository(collections["orders"])
+user_repo    = UserRepository(collections["users"])
+product_repo = ProductRepository(products)
+order_repo   = OrderRepository(collections["orders"])
+ratings_df   = pd.DataFrame(list(collections["reviews"].find({})))
 
-# === Load ratings ===
-reviews = list(collections["reviews"].find({}))
-ratings_df = pd.DataFrame(reviews)
-
-# === Initialize engines ===
-model_handler = BERTModelHandler(MODEL_PATH, VECTORS_PATH)
-collab_engine = CollaborativeEngine(
-    model_handler, collections, id_to_vector, name_to_id, id_to_name, labels,
-    restaurant_name_to_id, order_repo, product_repo, alpha=ALPHA
+# ========== Engines ==========
+model_handler   = BERTModelHandler(MODEL_PATH, VECTORS_PATH)
+collab_engine   = CollaborativeEngine(
+    model_handler, collections, id_to_vector,
+    name_to_id, id_to_name, labels,
+    restaurant_name_to_id, order_repo, product_repo,
+    alpha=ALPHA,
 )
-content_engine = ContentEngine(product_repo, order_repo)
+content_engine  = ContentEngine(product_repo, order_repo)
 fallback_engine = FallbackEngine(ratings_df)
+
 orchestrator = RecommendationOrchestrator(
     collab_engine, content_engine, fallback_engine,
-    id_to_name, id_to_vector, labels, restaurant_name_to_id, collections,
+    id_to_name, id_to_vector, labels,
+    restaurant_name_to_id, collections,
     lambda_mmr=LAMBDA_MMR,
     like_weight=LIKE_WEIGHT,
     dislike_penalty=DISLIKE_PENALTY,
-    redis_client=redis_client,
-    cache_expiry=CACHE_EXPIRY
 )
 
-# === ROUTES ===
+# ========== Helpers ==========
+def oid_list(ids):
+    return [ObjectId(x) for x in ids if ObjectId.is_valid(x)]
 
-@app.route("/recommendations", methods=["GET"])
-def get_full_recommendations():
-    user_id = request.args.get('user_id')
+def clean_doc(doc):
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+def save_recs(user_id: str, rec_type: str, payload: dict):
+    user_recs.update_one(
+        {"user_id": user_id, "type": rec_type},
+        {"$set": {"recommendations": payload, "created_at": datetime.utcnow()}},
+        upsert=True,
+    )
+
+# ========== ROUTES ==========
+
+@app.route("/recommendations/restaurants")
+def generate_restaurants():
+    user_id = request.args.get("user_id")
     if not user_id:
-        return jsonify({"error": "Missing user_id parameter"}), 400
+        return jsonify({"error": "Missing user_id"}), 400
 
-    cache_key = get_cache_key(user_id, "full")
-    cached = redis_client.get(cache_key)
-    if cached is not None:
-        try:
-            return jsonify(json.loads(cached)), 200
-        except json.JSONDecodeError:
-            print(f"[WARNING] Invalid cached JSON for {cache_key}")
-
-    result = orchestrator.get_recommendations(user_id, top_n=5)
-    if result:
-        redis_client.setex(cache_key, CACHE_EXPIRY, json.dumps(result))
-        return jsonify(result), 200
-    else:
+    res = orchestrator.get_recommendations(user_id, top_n=5)
+    if not res or not res.get("Recommendations"):
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
+    rest_ids = [rid for _, rid in res["Recommendations"]]
+    docs = restaurants.find({"_id": {"$in": oid_list(rest_ids)}})  # all fields
 
-@app.route("/recommendations/restaurants", methods=["GET"])
-def get_restaurant_recommendations():
-    user_id = request.args.get('user_id')
+    payload = {"RecommendedRestaurants": [clean_doc(d) for d in docs]}
+    save_recs(user_id, "restaurant", payload)
+    return jsonify(payload), 200
+
+
+@app.route("/recommendations/products")
+def generate_products():
+    user_id = request.args.get("user_id")
     if not user_id:
-        return jsonify({"error": "Missing user_id parameter"}), 400
+        return jsonify({"error": "Missing user_id"}), 400
 
-    cache_key = get_cache_key(user_id, "restaurant")
-    cached = redis_client.get(cache_key)
-    if cached is not None:
-        try:
-            return jsonify(json.loads(cached)), 200
-        except json.JSONDecodeError:
-            print(f"[WARNING] Invalid cached JSON for {cache_key}")
-
-    result = orchestrator.get_recommendations(user_id, top_n=5)
-    if result:
-        payload = {"RecommendedRestaurants": result["Recommendations"]}
-        redis_client.setex(cache_key, CACHE_EXPIRY, json.dumps(payload))
-        return jsonify(payload), 200
-    else:
+    res = orchestrator.get_recommendations(user_id, top_n=5)
+    if not res or not res.get("Products"):
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
+    # collect product IDs from orchestrator result
+    prod_ids = []
+    for lst in res["Products"].values():
+        prod_ids += [p.get("id") or p.get("_id") for p in lst]
 
-@app.route("/recommendations/products", methods=["GET"])
-def get_product_recommendations():
-    user_id = request.args.get('user_id')
-    if not user_id:
-        return jsonify({"error": "Missing user_id parameter"}), 400
+    # fetch EVERY field for each product
+    docs = products.find({"_id": {"$in": oid_list(prod_ids)}})  # no projection
 
-    cache_key = get_cache_key(user_id, "product")
-    cached = redis_client.get(cache_key)
-    if cached is not None:
-        try:
-            return jsonify(json.loads(cached)), 200
-        except json.JSONDecodeError:
-            print(f"[WARNING] Invalid cached JSON for {cache_key}")
-
-    result = orchestrator.get_recommendations(user_id, top_n=5)
+    payload = {"RecommendedProducts": [clean_doc(d) for d in docs]}
+    save_recs(user_id, "product", payload)
 
     try:
         send_kafka_message("recommendation_requests", {
             "user_id": user_id,
             "type": "product",
-            "result": result if result else {}
+            "result": payload
         })
     except Exception as e:
-        print(f"[WARNING] Kafka failed: {e}")
+        print("[WARN] Kafka send failed:", e)
 
-    if result:
-        recommended_products = []
-        for rest, products in result["Products"].items():
-            if isinstance(products, list):
-                for p in products:
-                    recommended_products.append({
-                        "restaurant": rest,
-                        "name": p.get("name"),
-                        "price": p.get("price"),
-                        "category": p.get("categorieName", "")
-                    })
-
-        payload = {"RecommendedProducts": recommended_products}
-        redis_client.setex(cache_key, CACHE_EXPIRY, json.dumps(payload))
-        return jsonify(payload), 200
-    else:
-        return jsonify({"error": f"No recommendations for user {user_id}"}), 404
+    return jsonify(payload), 200
 
 
-@app.route("/health", methods=["GET"])
-def health_check():
+@app.route("/stored/recommendations/restaurants")
+def stored_restaurants():
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+
+    doc = user_recs.find_one({"user_id": user_id, "type": "restaurant"})
+    if not doc:
+        return jsonify({"error": "No stored restaurant recommendations"}), 404
+    return jsonify(doc["recommendations"]), 200
+
+
+@app.route("/stored/recommendations/products")
+def stored_products():
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+
+    doc = user_recs.find_one({"user_id": user_id, "type": "product"})
+    if not doc:
+        return jsonify({"error": "No stored product recommendations"}), 404
+    return jsonify(doc["recommendations"]), 200
+
+
+@app.route("/health")
+def health():
     return jsonify({"status": "ok"}), 200
 
 
-# === Start the app ===
 if __name__ == "__main__":
-    print("[INFO] Starting Flask server on http://localhost:8000")
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    print("[INFO] API running on http://localhost:8000")
+    app.run("0.0.0.0", 8000, debug=True)
