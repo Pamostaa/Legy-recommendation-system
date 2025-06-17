@@ -2,13 +2,10 @@ model_path: "C:/Users/21655/OneDrive - Ministere de l'Enseignement Superieur et 
 vectors_path: "C:/Users/21655/OneDrive - Ministere de l'Enseignement Superieur et de la Recherche Scientifique/Desktop/RCxMongo/user_vectors.pkl"
 ratings_path: "C:/Users/21655/OneDrive - Ministere de l'Enseignement Superieur et de la Recherche Scientifique/Desktop/Recommendation_System/Data/cleaned_dakar_reviews01.csv"
 mongo_uri: mongodb://localhost:27017
-redis_host: localhost
-redis_port: 6379
 alpha: 0.01  
 weights:
-  ingredient_similarity: 0.3
-  price_proximity: 0.3
-  rating: 0.2
-  sentiment: 0.2
-lambda_mmr: 0.7  # 0.7 = 70% relevance, 30% novelty
-
+  - 0.3  # ingredient_similarity
+  - 0.3  # price_proximity
+  - 0.2  # rating
+  - 0.2  # sentiment
+lambda_mmr: 0.7
