@@ -17,7 +17,8 @@ def get_collections(client):
         "products": db["Products"],
         "orders": db["Orders"],
         "categories": pd.DataFrame(list(db["restaurant_categories"].find())),
-        "RestaurentReaction": db["RestaurentReaction"]
+        "RestaurentReaction": db["RestaurentReaction"],
+        "user_neighbors": db["user_neighbors"]
     }
 
 def reload_users(users_col):

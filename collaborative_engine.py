@@ -2,7 +2,14 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime
-import json
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename="app.log",
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 class CollaborativeEngine:
     def __init__(self, model_handler, collections, id_to_vector, name_to_id, id_to_name, labels,
@@ -10,6 +17,7 @@ class CollaborativeEngine:
         self.model_handler = model_handler
         self.collections = collections
         self.reviews_col = collections["reviews"]
+        self.neighbors_col = collections["user_neighbors"]
         self.id_to_vector = id_to_vector
         self.name_to_id = name_to_id
         self.id_to_name = id_to_name
@@ -58,6 +66,12 @@ class CollaborativeEngine:
         days_since = (current_time - created_at).days
         return np.exp(-self.alpha * days_since)
 
+    def get_precomputed_neighbors(self, user_id):
+        doc = self.neighbors_col.find_one({"user_id": user_id})
+        if not doc or "neighbors" not in doc:
+            return []
+        return [(n["user_id"], n["score"]) for n in doc["neighbors"]]
+
     def recommend_restaurants(self, user_id, top_n=5):
         top_n = min(top_n, self.MAX_RECOMMENDATIONS)
         user_name = self.id_to_name.get(user_id, user_id)
@@ -67,52 +81,44 @@ class CollaborativeEngine:
             if not self.rebuild_user_profile(user_id):
                 return None, []
 
-        user_rated = set(self.ratings[self.ratings["User"] == user_name]["Restaurant"])
-        count = len(user_rated)
-        dynamic_neighbors = 11 if count > 10 else max(3, count + 2)
+        sorted_similar = self.get_precomputed_neighbors(user_id)
+        if not sorted_similar:
+            logging.warning(f"No precomputed neighbors for user {user_id}, computing dynamically")
+            sorted_similar = self.get_top_neighbors(user_id, top_n=self.MAX_NEIGHBORS)
+            if not sorted_similar:
+                return None, []
 
-        sims = []
-        for other_id in self.id_to_vector:
+        neighbors = [u for u, _ in sorted_similar]
+        if not neighbors:
+            return None, []
+
+        user_rated = set(self.ratings[self.ratings["User"] == user_name]["Restaurant"])
+        neighbor_names = [self.id_to_name.get(uid, uid) for uid in neighbors]
+        neighbor_ratings = self.ratings[self.ratings["User"].isin(neighbor_names)].copy()
+        neighbor_ratings['decay_factor'] = neighbor_ratings['createdAt'].apply(lambda x: self.apply_time_decay(x, now))
+        neighbor_ratings['Weighted Rating'] = neighbor_ratings['User Rating'] * neighbor_ratings['decay_factor']
+
+        recs = neighbor_ratings[~neighbor_ratings["Restaurant"].isin(user_rated)]
+        top_restaurants = recs.groupby("Restaurant")["Weighted Rating"].mean().reset_index().sort_values(by="Weighted Rating", ascending=False)
+        top_restaurants = top_restaurants.head(top_n)
+        if not top_restaurants.empty:
+            return top_restaurants, sorted_similar
+
+        return None, []
+    def get_top_neighbors(self, user_id, top_n=10):
+        if user_id not in self.id_to_vector:
+            success = self.rebuild_user_profile(user_id)
+            if not success or user_id not in self.id_to_vector:
+                return []
+
+        user_vector = self.id_to_vector[user_id].reshape(1, -1)
+        similarities = []
+        vector_items = list(self.id_to_vector.items())
+        for other_id, other_vector in vector_items:
             if other_id == user_id:
                 continue
-            other_name = self.id_to_name.get(other_id, other_id)
-            other_rated = set(self.ratings[self.ratings["User"] == other_name]["Restaurant"])
-            overlap = len(user_rated & other_rated)
-            if overlap > 0 and len(other_rated) <= dynamic_neighbors:
-                new_items = len(other_rated - user_rated)
-                score = overlap + new_items
-                sims.append((other_id, score))
+            score = cosine_similarity(user_vector, other_vector.reshape(1, -1))[0][0]
+            similarities.append((other_id, score))
 
-        sorted_similar = sorted(sims, key=lambda x: (-self.vector_similarity(user_id, x[0]), -x[1]))[:self.MAX_NEIGHBORS]
-        neighbors = [u for u, _ in sorted_similar]
-
-        if neighbors:
-            neighbor_names = [self.id_to_name.get(uid, uid) for uid in neighbors]
-            neighbor_ratings = self.ratings[self.ratings["User"].isin(neighbor_names)].copy()
-            neighbor_ratings['decay_factor'] = neighbor_ratings['createdAt'].apply(lambda x: self.apply_time_decay(x, now))
-            neighbor_ratings['Weighted Rating'] = neighbor_ratings['User Rating'] * neighbor_ratings['decay_factor']
-
-            recs = neighbor_ratings[~neighbor_ratings["Restaurant"].isin(user_rated)]
-            top_restaurants = recs.groupby("Restaurant")["Weighted Rating"].mean().reset_index().sort_values(by="Weighted Rating", ascending=False)
-            top_restaurants = top_restaurants.head(top_n)
-            if not top_restaurants.empty:
-                return top_restaurants, sorted_similar
-
-        return None, []
-
-    # ⬇️ Redis-based caching support
-    def get_cached_recommendations(self, user_id, redis_client):
-        key = f"neighbors:{user_id}"
-        cached = redis_client.get(key)
-        if cached:
-            obj = json.loads(cached)
-            return pd.DataFrame(obj["top_restaurants"]), obj["sims"]
-        return None, []
-
-    def save_recommendations_to_cache(self, user_id, top_restaurants, sims, redis_client, ttl=864000):
-        key = f"neighbors:{user_id}"
-        payload = {
-            "top_restaurants": top_restaurants.to_dict(orient="records"),
-            "sims": sims
-        }
-        redis_client.setex(key, ttl, json.dumps(payload))
+        top_neighbors = sorted(similarities, key=lambda x: x[1], reverse=True)[:top_n]
+        return top_neighbors

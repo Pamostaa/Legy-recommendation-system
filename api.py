@@ -3,6 +3,14 @@ from flask_cors import CORS
 import yaml, pandas as pd, pickle
 from datetime import datetime
 from bson import ObjectId
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename="app.log",
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 # ========== App components ==========
 from data_loader import get_mongo_client, get_collections, reload_users
@@ -66,7 +74,7 @@ collab_engine   = CollaborativeEngine(
     restaurant_name_to_id, order_repo, product_repo,
     alpha=ALPHA,
 )
-content_engine  = ContentEngine(product_repo, order_repo)
+content_engine  = ContentEngine(product_repo, order_repo, weights=tuple(config["weights"]))
 fallback_engine = FallbackEngine(ratings_df)
 
 orchestrator = RecommendationOrchestrator(
@@ -106,7 +114,7 @@ def generate_restaurants():
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
     rest_ids = [rid for _, rid in res["Recommendations"]]
-    docs = restaurants.find({"_id": {"$in": oid_list(rest_ids)}})  # all fields
+    docs = restaurants.find({"_id": {"$in": oid_list(rest_ids)}})
 
     payload = {"RecommendedRestaurants": [clean_doc(d) for d in docs]}
     save_recs(user_id, "restaurant", payload)
@@ -123,14 +131,20 @@ def generate_products():
     if not res or not res.get("Products"):
         return jsonify({"error": f"No recommendations for user {user_id}"}), 404
 
-    # collect product IDs from orchestrator result
+    logging.debug(f"Products response for user {user_id}: {res['Products']}")
+
     prod_ids = []
-    for lst in res["Products"].values():
-        prod_ids += [p.get("id") or p.get("_id") for p in lst]
+    for rest_name, product_list in res["Products"].items():
+        if not isinstance(product_list, list):
+            logging.error(f"Expected list for products of {rest_name}, got {type(product_list)}")
+            continue
+        prod_ids.extend([str(pid) for pid in product_list if pid])
 
-    # fetch EVERY field for each product
-    docs = products.find({"_id": {"$in": oid_list(prod_ids)}})  # no projection
+    if not prod_ids:
+        logging.warning(f"No valid product IDs found for user {user_id}")
+        return jsonify({"error": "No valid product recommendations available"}), 404
 
+    docs = products.find({"_id": {"$in": oid_list(prod_ids)}})
     payload = {"RecommendedProducts": [clean_doc(d) for d in docs]}
     save_recs(user_id, "product", payload)
 
