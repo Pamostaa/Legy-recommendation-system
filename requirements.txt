@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 flask
 flask_cors
 pandas
@@ -5,9 +6,9 @@ numpy
 scikit-learn
 vaderSentiment
 pymongo
-redis
 pyyaml
 nltk
 transformers
-torch --extra-index-url https://download.pytorch.org/whl/cpu
-
+torch
+supervisor
+gunicorn

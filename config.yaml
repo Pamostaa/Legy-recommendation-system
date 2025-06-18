@@ -1,8 +1,7 @@
-model_path: "C:/Users/21655/OneDrive - Ministere de l'Enseignement Superieur et de la Recherche Scientifique/Desktop/Recommendation_System/models/bert_preference_model"
-vectors_path: "C:/Users/21655/OneDrive - Ministere de l'Enseignement Superieur et de la Recherche Scientifique/Desktop/RCxMongo/user_vectors.pkl"
-ratings_path: "C:/Users/21655/OneDrive - Ministere de l'Enseignement Superieur et de la Recherche Scientifique/Desktop/Recommendation_System/Data/cleaned_dakar_reviews01.csv"
-mongo_uri: mongodb://localhost:27017
-alpha: 0.01  
+mongo_uri: mongodb://mongodb:27017
+model_path: /app/models/bert_preference_model
+vectors_path: /app/models/user_vectors.pkl
+alpha: 0.01
 weights:
   - 0.3  # ingredient_similarity
   - 0.3  # price_proximity
