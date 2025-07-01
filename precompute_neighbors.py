@@ -5,6 +5,7 @@ from collaborative_engine import CollaborativeEngine
 from data_loader import get_mongo_client, get_collections, reload_users
 from product_repository import ProductRepository
 from order_repository import OrderRepository
+from drive_utils import ensure_model_files
 
 # === Load config ===
 with open("config.yaml") as f:
@@ -13,6 +14,13 @@ with open("config.yaml") as f:
 model_path = config["model_path"]
 vectors_path = config["vectors_path"]
 alpha = config.get("alpha", 0.01)
+
+# === Ensure model files are available ===
+ensure_model_files()
+
+# === Initialize model handler ===
+model_handler = BERTModelHandler(model_path, vectors_path)
+id_to_vector = model_handler.id_to_vector
 
 # === Mongo connection ===
 client = get_mongo_client()
@@ -31,8 +39,6 @@ restaurant_name_to_id = {
 }
 
 # === Init engine ===
-model_handler = BERTModelHandler(model_path, vectors_path)
-id_to_vector = model_handler.id_to_vector
 product_repo = ProductRepository(collections["products"])
 order_repo = OrderRepository(collections["orders"])
 

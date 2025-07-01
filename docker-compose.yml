@@ -11,13 +11,14 @@ services:
       - zookeeper-data:/data
       - zookeeper-datalog:/datalog
     healthcheck:
-      test: ["CMD-SHELL", "zookeeper-shell localhost:2181 ls / | grep zookeeper"]
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
+      start_period: 10s
     mem_limit: 512m
     networks:
-      - leggy-network
+      - recommender-network
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -27,83 +28,84 @@ services:
         condition: service_healthy
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_MESSAGE_MAX_BYTES: 2147483647
-      KAFKA_REPLICA_FETCH_MAX_BYTES: 2147483647
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
       KAFKA_LOG_SEGMENT_BYTES: 1073741824
       KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: 60000
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 209715200
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "localhost:9092"]
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
       interval: 10s
       timeout: 10s
       retries: 10
+      start_period: 60s
     mem_limit: 768m
     networks:
-      - leggy-network
+      - recommender-network
 
   mongodb:
     image: mongo:6.0
-    container_name: mongo-recommender
+    container_name: mongo
     ports:
-      - "27018:27017"
+      - "27017:27017"
     volumes:
       - mongo-data:/data/db
     environment:
       MONGO_INITDB_ROOT_USERNAME: legy
       MONGO_INITDB_ROOT_PASSWORD: legy123
       MONGO_INITDB_DATABASE: leggydb
-    command: ["mongod", "--wiredTigerCacheSizeGB=0.25"]
     healthcheck:
-      test: ["CMD-SHELL", "mongo --host localhost --port 27017 --username legy --password legy123 --authenticationDatabase admin --eval 'db.adminCommand(\"ping\")'"]
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
-      timeout: 15s
-      retries: 20
-      start_period: 30s
-    mem_limit: 1g
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    mem_limit: 512m
     networks:
-      - mongo-network
+      - recommender-network
 
-  recommender:
-    build: .
-    container_name: recommender
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
-      - MONGODB_URI=mongodb://legy:legy123@mongodb:27017/leggydb
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    mem_limit: 1.5g
+      - MONGO_URI=mongodb://legy:legy123@mongo:27017/leggydb?authSource=admin
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - NLTK_DATA=/app/nltk_data
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - model-data:/app/models
+    mem_limit: 2g
     networks:
-      - leggy-network
-      - mongo-network
+      - recommender-network
 
 networks:
-  leggy-network:
-    driver: bridge
-  mongo-network:
+  recommender-network:
     driver: bridge
 
 volumes:
-  mongo-data:
   kafka-data:
   zookeeper-data:
   zookeeper-datalog:
+  mongo-data:
+  model-data:

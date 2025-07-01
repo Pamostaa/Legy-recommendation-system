@@ -1,6 +1,5 @@
-mongo_uri: mongodb://mongodb:27017
-model_path: /app/models/bert_preference_model
-vectors_path: /app/models/user_vectors.pkl
+model_path: "models/bert_preference_model"
+vectors_path: "models/user_vectors.pkl"
 alpha: 0.01
 weights:
   - 0.3  # ingredient_similarity
@@ -8,3 +7,5 @@ weights:
   - 0.2  # rating
   - 0.2  # sentiment
 lambda_mmr: 0.7
+mongo_uri: "mongodb://legy:legy123@mongo:27017/leggydb?authSource=admin"
+kafka_brokers: ${KAFKA_BROKERS:-kafka:9092}

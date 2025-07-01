@@ -8,31 +8,33 @@ from nltk.corpus import stopwords
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import nltk
 import logging
+import os
 from typing import List, Optional
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    filename="app.log",
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+NLTK_DATA = os.getenv("NLTK_DATA", "/app/nltk_data")
+nltk.data.path.append(NLTK_DATA)
 
 try:
     nltk.data.find('corpora/stopwords')
 except LookupError:
-    nltk.download('stopwords', quiet=True)
+    logging.info("Downloading NLTK stopwords")
+    nltk.download('stopwords', download_dir=NLTK_DATA, quiet=True)
 
 vader_analyzer = SentimentIntensityAnalyzer()
 try:
     stop_words = set(stopwords.words('english') + stopwords.words('french'))
-except:
+except Exception as e:
+    logging.warning(f"Failed to load stopwords: {e}")
     stop_words = set(["the", "a", "an", "and", "or", "of", "to", "in", "et", "le", "la", "de", "un", "une"])
 
 class ContentBasedProductRecommender:
-    def __init__(self, product_repository, order_repository, weights):
+    def __init__(self, product_repository, order_repository, weights, Category):
         self.product_repository = product_repository
         self.order_repository = order_repository
         self.weights = weights
+        # Load category mapping
+        categories = list(Category.find())
+        self.category_id_to_name = {str(cat['_id']): cat['name'] for cat in categories}
         self.df = self._load_products()
 
     def _load_products(self):
@@ -41,14 +43,20 @@ class ContentBasedProductRecommender:
         if df.empty:
             logging.error("No products loaded from repository")
             return pd.DataFrame()
-        df = df[df["price"].notnull() & df["description"].notnull() & df["restaurant_Id"].notnull()]
+        if "pricePostCom" not in df.columns:
+            logging.error("No 'pricePostCom' field found in products collection. Please check your data.")
+            return pd.DataFrame()
+        df = df[df["pricePostCom"].notnull() & df["description"].notnull() & df["restaurantId"].notnull()]
         df["description"] = df["description"].astype(str)
         df["_id"] = df["_id"].astype(str)
-        df["restaurant_Id"] = df["restaurant_Id"].astype(str)
+        df["restaurantId"] = df["restaurantId"].astype(str)
+        # Add category_name column
+        if 'category' in df.columns:
+            df['category_name'] = df['category'].apply(lambda cid: self.category_id_to_name.get(str(cid), 'Unknown'))
         df["CleanText"] = df["description"].apply(self._preprocess_text)
-        df["PriceValue"] = pd.to_numeric(df["price"], errors='coerce')
+        df["PriceValue"] = pd.to_numeric(df["pricePostCom"], errors='coerce')
         df = df.dropna(subset=["PriceValue"])
-        df["Rating"] = 3.5  # Default rating
+        df["Rating"] = 3.5
         df["Sentiment"] = df["description"].apply(self._compute_sentiment)
         df = df.reset_index(drop=True)
         logging.debug(f"Loaded {len(df)} products")
@@ -88,23 +96,20 @@ class ContentBasedProductRecommender:
         user_product_ids = self._get_user_product_ids(client_id)
         logging.debug(f"Processing recommendations for user {client_id}, restaurant {restaurant_id}")
 
-        # Case 1: Specific restaurant
         if restaurant_id:
-            rest_df = self.df[self.df["restaurant_Id"] == str(restaurant_id)]
+            rest_df = self.df[self.df["restaurantId"] == str(restaurant_id)]
             if rest_df.empty:
                 logging.debug(f"No products for restaurant {restaurant_id}")
                 return []
             if not user_product_ids:
                 logging.debug(f"No order history for {client_id}, using random fallback for restaurant {restaurant_id}")
-                return self._random_fallback(rest_df, top_n)
+                return self._random_fallback(rest_df, top_n, restaurant_id)
             return self._recommend_similar_products(rest_df, user_product_ids, top_n)
 
-        # Case 2: No specific restaurant (fallback)
         if not user_product_ids:
             logging.debug(f"No order history for {client_id}, using random fallback")
-            return self._random_fallback(self.df, top_n)
+            return self._random_fallback(self.df, top_n, None)
 
-        # Case 2a: Recommend similar products from all restaurants
         logging.debug(f"Recommending similar products for {client_id} from all restaurants")
         return self._recommend_similar_products(self.df, user_product_ids, top_n)
 
@@ -112,7 +117,7 @@ class ContentBasedProductRecommender:
         user_df = self.df[self.df["_id"].isin(user_product_ids)]
         if user_df.empty:
             logging.debug(f"No matching products for user history, using random fallback")
-            return self._random_fallback(target_df, top_n)
+            return self._random_fallback(target_df, top_n, target_df["restaurantId"].iloc[0] if not target_df.empty else None)
 
         avg_price = user_df["PriceValue"].mean()
         vectorizer = TfidfVectorizer()
@@ -131,7 +136,7 @@ class ContentBasedProductRecommender:
             w2 * target_df["PriceProximity"] +
             w3 * (target_df["Rating"] / 5.0) +
             w4 * ((target_df["Sentiment"] + 1) / 2) +
-            np.random.uniform(0, 0.01, len(target_df))  # Break ties
+            np.random.uniform(0, 0.01, len(target_df))
         )
 
         filtered_df = target_df[~target_df["_id"].isin(user_product_ids)]
@@ -139,21 +144,32 @@ class ContentBasedProductRecommender:
 
         if filtered_df.empty:
             logging.debug(f"No filtered products, using random fallback")
-            return self._random_fallback(target_df, top_n)
+            return self._random_fallback(target_df, top_n, target_df["restaurantId"].iloc[0] if not target_df.empty else None)
 
         logging.debug(f"Scores: {filtered_df[['_id', 'name', 'IngredientSimilarity', 'PriceProximity', 'FinalScore']].to_dict('records')}")
         top_df = filtered_df.sort_values(by="FinalScore", ascending=False).head(top_n)
         return top_df.to_dict(orient="records")
 
-    def _random_fallback(self, df: pd.DataFrame, top_n: int) -> List[dict]:
+    def _random_fallback(self, df: pd.DataFrame, top_n: int, restaurant_id: Optional[str]) -> List[dict]:
         if df.empty:
             return []
-        if "category" in df.columns:
-            top_df = df.groupby("category").apply(
+        # Filter by restaurant_id if provided
+        if restaurant_id:
+            df = df[df["restaurantId"] == str(restaurant_id)]
+            if df.empty:
+                logging.debug(f"No products available for restaurant {restaurant_id} in fallback")
+                return []
+        # Prioritize popular products by Rating or order frequency
+        if "Rating" in df.columns:
+            top_df = df.sort_values(by="Rating", ascending=False).head(top_n * 2)
+        else:
+            top_df = df
+        if "category_name" in top_df.columns:
+            top_df = top_df.groupby("category_name").apply(
                 lambda x: x.sample(n=min(1, len(x)), random_state=None)
             ).reset_index(drop=True)
             if len(top_df) >= top_n:
                 return top_df.head(top_n).to_dict(orient="records")
-        top_df = df.sample(n=min(top_n, len(df)), random_state=None)
+        top_df = top_df.sample(n=min(top_n, len(top_df)), random_state=None)
         logging.debug(f"Random fallback selected {len(top_df)} products")
         return top_df.to_dict(orient="records")

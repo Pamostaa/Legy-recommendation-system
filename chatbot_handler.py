@@ -47,7 +47,7 @@ products_df = pd.DataFrame(list(collections["products"].find()))
 products_df["restaurant_Id"] = products_df["restaurant_Id"].astype(str)
 
 # Load and process restaurants
-restaurants_cursor = collections["restaurents"].find({}, {"_id": 1, "nom": 1, "averageRating": 1})
+restaurants_cursor = collections["restaurants"].find({}, {"_id": 1, "nom": 1, "averageRating": 1})
 restaurants_df = pd.DataFrame(list(restaurants_cursor))
 restaurants_df["_id"] = restaurants_df["_id"].astype(str)
 restaurants_df.rename(columns={"_id": "restaurant_Id"}, inplace=True)

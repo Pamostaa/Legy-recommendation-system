@@ -1,23 +1,31 @@
-# Bytecode
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+Bytecode
 
-# Logs
+pycache/ *.pyc *.pyo *.pyd
+
+Logs
+
 *.log
 
-# Temp files
+Temp files
+
 *.tmp
 
-# Development folders
-tests/
-notebooks/
+Development folders
 
-# Data files you don’t need in container
-*.csv
-*.md
+tests/ notebooks/
 
-# OS / Git metadata
-.DS_Store
-.git/
+Data files
+
+*.csv *.md *.zip *.tar.gz
+
+OS / Git metadata
+
+.DS_Store .git/ .gitignore
+
+Virtual environments
+
+venv/ .env
+
+Exclude large files not needed
+
+*.bak *.swp

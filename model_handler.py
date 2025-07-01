@@ -6,12 +6,21 @@ from transformers import BertTokenizer, BertForSequenceClassification
 from torch.nn.functional import softmax
 import yaml
 import os
+import logging
+from drive_utils import ensure_model_files
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 with open('config.yaml') as f:
     config = yaml.safe_load(f)
 
 class BERTModelHandler:
     def __init__(self, model_path, vectors_path):
+        # Ensure model files are downloaded from Drive
+        ensure_model_files()
+        
+        logger.info(f"Loading BERT model from {model_path}")
         self.tokenizer = BertTokenizer.from_pretrained(model_path)
         self.model = BertForSequenceClassification.from_pretrained(model_path)
         self.model.eval()
@@ -29,28 +38,29 @@ class BERTModelHandler:
         try:
             with open(self.vectors_path, "wb") as f:
                 pickle.dump(self.id_to_vector, f)
-            print(f"[INFO] Saved vectors to {self.vectors_path}")
+            logger.info(f"Saved vectors to {self.vectors_path}")
         except Exception as e:
-            print(f"[ERROR] Failed to save vectors: {e}")
+            logger.error(f"Failed to save vectors: {e}")
+            raise
 
     def load_vectors(self):
         if not os.path.exists(self.vectors_path):
-            print(f"[WARNING] Vectors file not found at {self.vectors_path}. Starting with empty vectors.")
+            logger.warning(f"Vectors file not found at {self.vectors_path}. Starting with empty vectors.")
             return {}
 
         if os.path.getsize(self.vectors_path) == 0:
-            print(f"[WARNING] Vectors file is empty at {self.vectors_path}. Starting with empty vectors.")
+            logger.warning(f"Vectors file is empty at {self.vectors_path}. Starting with empty vectors.")
             return {}
 
         try:
             with open(self.vectors_path, "rb") as f:
                 vectors = pickle.load(f)
                 if isinstance(vectors, dict):
-                    print(f"[INFO] Loaded {len(vectors)} vectors from {self.vectors_path}")
+                    logger.info(f"Loaded {len(vectors)} vectors from {self.vectors_path}")
                     return vectors
                 else:
-                    print(f"[WARNING] Unexpected vector format in {self.vectors_path}. Starting empty.")
+                    logger.warning(f"Unexpected vector format in {self.vectors_path}. Starting empty.")
                     return {}
         except Exception as e:
-            print(f"[ERROR] Could not load vectors: {e}. Starting with empty.")
+            logger.error(f"Could not load vectors: {e}. Starting with empty.")
             return {}
